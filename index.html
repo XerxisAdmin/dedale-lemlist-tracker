@@ -35,7 +35,7 @@ input,select{font-family:inherit;font-size:14px}
 .section-label{font-size:11px;letter-spacing:1.4px;text-transform:uppercase;color:var(--ink3);font-weight:600;margin-bottom:14px;font-family:'IBM Plex Mono',monospace}
 
 /* ---- KPI row ---- */
-.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:34px}
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-bottom:34px}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 20px;position:relative;overflow:hidden}
 .kpi .cap{font-size:12px;color:var(--ink2);font-weight:500;display:flex;align-items:center;gap:6px}
 .kpi .big{font-size:30px;font-weight:600;margin-top:8px;letter-spacing:-.5px}
@@ -44,6 +44,7 @@ input,select{font-family:inherit;font-size:14px}
 .kpi.cost .accent-bar{background:var(--warn)}
 .kpi.rate .accent-bar{background:var(--am)}
 .kpi.runout .accent-bar{background:var(--pm)}
+.kpi.refill .accent-bar{background:#4fd0d0}
 
 /* ---- Buttons ---- */
 .btn{border:1px solid var(--line2);background:var(--panel2);color:var(--ink);padding:9px 15px;border-radius:8px;font-size:13px;font-weight:500;display:inline-flex;align-items:center;gap:7px;transition:.15s}
@@ -125,6 +126,9 @@ tbody tr:hover{background:var(--panel2)}
 .chart-box{position:relative;height:280px}
 .chart-box.tall{height:320px}
 
+@media(max-width:1200px) and (min-width:901px){
+  .kpis{grid-template-columns:repeat(3,1fr)}
+}
 @media(max-width:900px){
   .kpis{grid-template-columns:repeat(2,1fr)}
   .grid2{grid-template-columns:1fr}
@@ -147,6 +151,7 @@ tbody tr:hover{background:var(--panel2)}
   <div class="topbar-actions">
     <button class="btn btn-sm" onclick="exportCSV()">↓ Export CSV</button>
     <button class="btn btn-sm btn-ghost" onclick="openSettings()">⚙ Teams</button>
+    <button class="btn btn-sm btn-ghost" onclick="resetData()" title="Reload demo data" style="color:var(--ink3)">↻ Reset</button>
   </div>
 </div>
 
@@ -161,6 +166,15 @@ tbody tr:hover{background:var(--panel2)}
 
   <!-- ============ DASHBOARD ============ -->
   <div class="view active" id="view-dashboard">
+    <div style="display:flex;align-items:center;justify-content:center;gap:16px;margin-bottom:22px">
+      <button class="btn btn-sm" id="nav-prev" onclick="navDay(-1)" title="Previous day">‹ Prev</button>
+      <div style="text-align:center;min-width:220px">
+        <div id="nav-date" class="mono" style="font-size:18px;font-weight:600">—</div>
+        <div id="nav-sub" style="font-size:12px;color:var(--ink3);font-family:'IBM Plex Mono',monospace;margin-top:2px"></div>
+      </div>
+      <button class="btn btn-sm" id="nav-next" onclick="navDay(1)" title="Next day">Next ›</button>
+      <button class="btn btn-sm btn-ghost" onclick="navToday()" title="Jump to today" style="margin-left:4px">Today</button>
+    </div>
     <div class="kpis" id="kpis"></div>
 
     <div class="panel" style="margin-bottom:20px;display:flex;flex-wrap:wrap;align-items:center;gap:24px;padding:14px 22px">
@@ -190,7 +204,7 @@ tbody tr:hover{background:var(--panel2)}
 
     <div class="panel">
       <div class="panel-head">
-        <h2>Team status — today</h2>
+        <h2 id="team-status-title">Team status — today</h2>
         <div class="legend">
           <span><span class="sw" style="background:var(--am)"></span>Morning (shift→12nn)</span>
           <span><span class="sw" style="background:var(--pm)"></span>Afternoon (12nn→6pm)</span>
@@ -265,7 +279,7 @@ const COST_PER_CREDIT_USD=0.01;
 let usdToEur=0.92; // editable
 const CREDIT_PER_5K_EUR=120, SEAT_EUR=69, BUDGET_EUR=1500;
 const PALETTE=['#3fd08a','#5b9bd5','#e0a83a','#b57ee0','#e85d5d','#4fd0d0','#d58a5b','#8a9be0'];
-let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null;
+let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null;
 
 /* ---------- storage ---------- */
 async function loadAll(){
@@ -325,6 +339,21 @@ function teamConsumption(date,tmId){
 }
 function sortedDates(){return [...new Set(readings.map(r=>r.date))].sort();}
 
+/* ---------- refill detection ---------- */
+// Detects positive jumps between consecutive checkpoints within a day = credits added.
+function teamRefill(date,tmId){
+  const r=recFor(date);if(!r||!r.bal[tmId])return {added:0,events:[]};
+  const b=r.bal[tmId];let added=0;const events=[];
+  if(b.start!=null&&b.noon!=null&&b.noon>b.start){added+=b.noon-b.start;events.push({seg:'9am→12nn',amt:b.noon-b.start});}
+  if(b.noon!=null&&b.end!=null&&b.end>b.noon){added+=b.end-b.noon;events.push({seg:'12nn→6pm',amt:b.end-b.noon});}
+  return {added,events};
+}
+function refillFor(date){
+  let added=0,teamsHit=0;
+  teams.forEach(tm=>{const rf=teamRefill(date,tm.id);if(rf.added>0){added+=rf.added;teamsHit++;}});
+  return {added,teamsHit};
+}
+
 /* ---------- views ---------- */
 function switchView(v,btn){
   document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));
@@ -337,18 +366,53 @@ function switchView(v,btn){
 
 /* ---------- dashboard ---------- */
 function renderDashboard(){
+  if(!viewDate)viewDate=todayStr();
+  renderNav();
   renderKPIs();
   renderTrendChart();
   renderTeamChart();
   renderTeamTable();
 }
+// Navigate across days that have data (plus today), sorted.
+function navDates(){
+  const s=new Set(sortedDates());
+  s.add(todayStr());
+  return [...s].sort();
+}
+function navDay(dir){
+  const list=navDates();
+  let idx=list.indexOf(viewDate);
+  if(idx===-1){viewDate=todayStr();idx=list.indexOf(viewDate);}
+  const ni=idx+dir;
+  if(ni<0||ni>=list.length)return;
+  viewDate=list[ni];
+  renderDashboard();
+}
+function navToday(){viewDate=todayStr();renderDashboard();}
+function renderNav(){
+  const list=navDates();
+  const idx=list.indexOf(viewDate);
+  const isToday=viewDate===todayStr();
+  const rec=recFor(viewDate);
+  document.getElementById('nav-date').textContent=viewDate;
+  let sub=isToday?'Today':'';
+  if(rec&&rec.baseline)sub=(sub?sub+' · ':'')+'baseline day';
+  else if(!rec)sub=(sub?sub+' · ':'')+'no readings';
+  document.getElementById('nav-sub').textContent=sub;
+  const prev=document.getElementById('nav-prev'),next=document.getElementById('nav-next');
+  const atStart=idx<=0, atEnd=idx>=list.length-1;
+  prev.style.opacity=atStart?'.35':'1';prev.style.pointerEvents=atStart?'none':'auto';
+  next.style.opacity=atEnd?'.35':'1';next.style.pointerEvents=atEnd?'none':'auto';
+}
 function renderKPIs(){
-  const today=todayStr();
+  const vd=viewDate||todayStr();
+  const isToday=vd===todayStr();
   const dates=sortedDates();
-  const todayC=consumptionFor(today);
+  const todayC=consumptionFor(vd);
   const todayTotal=todayC?todayC.total:0;
+  const dayLabel=isToday?'today':'that day';
 
-  // avg daily over days that have full data
+  // avg daily over days that have full data (all-time)
   const daily=dates.map(d=>consumptionFor(d)).filter(c=>c&&c.total>0);
   const avg=daily.length?Math.round(daily.reduce((s,c)=>s+c.total,0)/daily.length):0;
 
@@ -361,11 +425,18 @@ function renderKPIs(){
   let runout='—';
   if(haveRemaining&&avg>0){const days=Math.floor(remaining/avg);runout=days+' days';}
 
+  // refills across all data
+  let totalRefill=0,refillDays=0;
+  dates.forEach(d=>{const rf=refillFor(d);if(rf.added>0){totalRefill+=rf.added;refillDays++;}});
+  const todayRefill=refillFor(vd);
+
+  const baseNote=(todayC&&todayC.baseline)?'baseline day — not counted':(todayC&&todayC.hasPm?'full shift logged':(todayC&&todayC.hasAm?'morning only':'no data yet'));
   const kpis=[
-    {cls:'',cap:'◈ Used today',big:fmt(todayTotal),foot:todayC&&todayC.hasPm?'full shift logged':(todayC&&todayC.hasAm?'morning only':'no data yet')},
-    {cls:'cost',cap:'◆ Cost today',big:eur(costEUR(todayTotal)),foot:usd(costUSD(todayTotal))+' · @ $0.01/credit'},
+    {cls:'',cap:'◈ Used '+dayLabel,big:(todayC&&todayC.baseline)?'—':fmt(todayTotal),foot:baseNote},
+    {cls:'cost',cap:'◆ Cost '+dayLabel,big:(todayC&&todayC.baseline)?'—':eur(costEUR(todayTotal)),foot:(todayC&&todayC.baseline)?'baseline':usd(costUSD(todayTotal))+' · @ $0.01/credit'},
     {cls:'rate',cap:'▲ Avg daily burn',big:fmt(avg),foot:daily.length+' day'+(daily.length===1?'':'s')+' tracked'},
-    {cls:'runout',cap:'● Est. runway',big:runout,foot:haveRemaining?fmt(remaining)+' left':'log balances to project'}
+    {cls:'runout',cap:'● Est. runway',big:runout,foot:haveRemaining?fmt(remaining)+' left':'log balances to project'},
+    {cls:'refill',cap:'⟳ Refills — '+dayLabel,big:fmt(todayRefill.added),foot:todayRefill.added>0?todayRefill.teamsHit+' team'+(todayRefill.teamsHit===1?'':'s')+' · '+eur(costEUR(todayRefill.added)):'all-time: '+fmt(totalRefill)}
   ];
   document.getElementById('kpis').innerHTML=kpis.map(k=>
     '<div class="kpi '+k.cls+'"><div class="accent-bar"></div><div class="cap">'+k.cap+'</div><div class="big num">'+k.big+'</div><div class="foot">'+k.foot+'</div></div>'
@@ -386,7 +457,7 @@ function renderTrendChart(){
   ]},options:chartOpts(true)});
 }
 function renderTeamChart(){
-  const today=todayStr();
+  const today=viewDate||todayStr();
   const data=teams.map(tm=>teamConsumption(today,tm.id).total);
   if(teamChart)teamChart.destroy();
   const ctx=document.getElementById('teamChart');
@@ -396,7 +467,8 @@ function renderTeamChart(){
   ]},options:{...chartOpts(false),indexAxis:'y',plugins:{legend:{display:false},tooltip:tooltipStyle()}}});
 }
 function renderTeamTable(){
-  const today=todayStr();
+  const today=viewDate||todayStr();
+  const tt=document.getElementById('team-status-title');if(tt)tt.textContent='Team status — '+(today===todayStr()?'today':today);
   const r=recFor(today);
   const rows=teams.map(tm=>{
     const c=teamConsumption(today,tm.id);
@@ -407,6 +479,8 @@ function renderTeamTable(){
     const pmPct=total>0?(c.pm/total*100):0;
     let status='<span class="pill ok">tracked</span>';
     if(!r||remaining==null)status='<span class="pill warn">no reading</span>';
+    const rf=teamRefill(today,tm.id);
+    if(rf.added>0)status+=' <span class="pill" style="background:#0c2a2a;color:#4fd0d0" title="Balance rose '+fmt(rf.added)+' \u2014 credits added">⟳ +'+fmt(rf.added)+'</span>';
     return '<tr>'+
       '<td><span class="team-name"><span class="dot" style="background:'+tm.color+'"></span>'+esc(tm.name)+'</span></td>'+
       '<td class="num">'+(b.start!=null?fmt(b.start):'—')+'</td>'+
@@ -475,15 +549,18 @@ function renderHistory(){
   const rows=dates.map(d=>{
     const c=consumptionFor(d);
     const isBase=recFor(d)&&recFor(d).baseline;
+    const rf=refillFor(d);
+    const refillCell=rf.added>0?'<span style="color:#4fd0d0">⟳ '+fmt(rf.added)+'</span> <span style="color:var(--ink3);font-size:.85em">('+rf.teamsHit+' team'+(rf.teamsHit===1?'':'s')+')</span>':'<span style="color:var(--ink3)">—</span>';
     return '<tr><td class="num">'+d+(isBase?' <span class="pill warn" style="margin-left:6px">baseline</span>':'')+'</td>'+
       '<td class="num">'+(isBase?'—':(c?fmt(c.am):'—'))+'</td>'+
       '<td class="num">'+(isBase?'—':(c?fmt(c.pm):'—'))+'</td>'+
       '<td class="num" style="font-weight:600">'+(isBase?'—':(c?fmt(c.total):'—'))+'</td>'+
+      '<td class="num">'+refillCell+'</td>'+
       '<td class="num" style="color:var(--credit)">'+(isBase?'—':(c?money(c.total):'—'))+'</td>'+
       '<td><button class="btn btn-sm btn-ghost" onclick="editDay(\''+d+'\')">Edit</button> <button class="btn btn-sm btn-ghost" onclick="delDay(\''+d+'\')" style="color:var(--danger)">Delete</button></td></tr>';
   }).join('');
   document.getElementById('history-wrap').innerHTML=
-    '<table><thead><tr><th>Date</th><th>Morning</th><th>Afternoon</th><th>Total used</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
+    '<table><thead><tr><th>Date</th><th>Morning</th><th>Afternoon</th><th>Total used</th><th>Refills</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 function editDay(d){document.getElementById('log-date').value=d;switchView('log',document.querySelectorAll('.tabbar button')[1]);setCheckpoint('start',document.querySelector('.cp-tab'));renderLogInputs();toast('Editing '+d);}
 async function delDay(d){if(!confirm('Delete all readings for '+d+'?'))return;readings=readings.filter(r=>r.date!==d);await saveReadingsStore();renderHistory();toast('Deleted '+d);}
@@ -520,22 +597,33 @@ function exportCSV(){
 
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
 
+/* ---------- seed / reset ---------- */
+function buildSeed(){
+  const byName=n=>teams.find(t=>t.name===n);
+  // July 1 — SETUP/BASELINE day: initial 5,000 seed + mid-day top-ups (some teams >5,000).
+  // Flagged baseline so its mixed usage+refill numbers don't count as real consumption.
+  const j1={date:'2026-07-01',baseline:true,bal:{}};
+  const j1data={Avito:[5000,119,119],Eve:[5000,5000,5000],Celia:[5000,5200,5200],Han:[5000,5000,5000],Jenny:[5000,4900,4900],Reyna:[5000,9600,9600],PJ:[5000,7400,7400],Cielo:[5000,8000,8000]};
+  teams.forEach(tm=>{const d=j1data[tm.name];if(d)j1.bal[tm.id]={start:d[0],noon:d[1],end:d[2]};});
+  // July 2 — first REAL tracked day (clean downward consumption). 6pm still to be logged.
+  const j2={date:'2026-07-02',bal:{}};
+  const j2data={Avito:[119,74],Eve:[4800,4400],Celia:[5100,4900],Han:[4600,4500],Jenny:[4700,4700],Reyna:[9600,9300],PJ:[7400,7400],Cielo:[8000,8000]};
+  teams.forEach(tm=>{const d=j2data[tm.name];if(d)j2.bal[tm.id]={start:d[0],noon:d[1]};});
+  return [j1,j2];
+}
+async function resetData(){
+  if(!confirm('Reset all data and reload the July 1 (baseline) + July 2 demo readings?\n\nThis clears anything currently logged.'))return;
+  readings=buildSeed();
+  await saveReadingsStore();
+  document.getElementById('log-date').value=todayStr();
+  renderLogInputs();renderDashboard();
+  toast('Data reset to July 1 baseline + July 2');
+}
+
 /* ---------- boot ---------- */
 (async function(){
   await loadAll();
-  // Seed prototype (first run only)
-  if(readings.length===0){
-    // July 1, 9 AM CET — all teams start at 5,000 credits
-    const seed={date:'2026-07-01',bal:{}};
-    teams.forEach(tm=>{seed.bal[tm.id]={start:5000};});
-    readings.push(seed);
-    // Today — 4:47pm CET wildcard snapshot (accounts replenished mid-day). Flagged baseline.
-    const bal447={Avito:119,Eve:5000,Celia:5200,Han:5000,Jenny:4900,Reyna:9600,PJ:7400,Cielo:8000};
-    const wildcard={date:todayStr(),baseline:true,bal:{}};
-    teams.forEach(tm=>{if(bal447[tm.name]!=null)wildcard.bal[tm.id]={end:bal447[tm.name]};});
-    if(todayStr()!=='2026-07-01')readings.push(wildcard);
-    await saveReadingsStore();
-  }
+  if(readings.length===0){readings=buildSeed();await saveReadingsStore();}
   document.getElementById('log-date').value=todayStr();
   document.getElementById('fx-rate').value=usdToEur;
   document.getElementById('log-date').addEventListener('change',renderLogInputs);
