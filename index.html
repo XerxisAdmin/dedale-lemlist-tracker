@@ -149,6 +149,9 @@ tbody tr:hover{background:var(--panel2)}
     </div>
   </div>
   <div class="topbar-actions">
+    <button class="btn btn-sm" onclick="backupJSON()" title="Save all data to a file">⭳ Backup</button>
+    <button class="btn btn-sm" onclick="document.getElementById('restore-file').click()" title="Load data from a backup file">⭱ Restore</button>
+    <input type="file" id="restore-file" accept="application/json,.json" style="display:none" onchange="restoreJSON(this)">
     <button class="btn btn-sm" onclick="exportCSV()">↓ Export CSV</button>
     <button class="btn btn-sm btn-ghost" onclick="openSettings()">⚙ Teams</button>
     <button class="btn btn-sm btn-ghost" onclick="resetData()" title="Reload demo data" style="color:var(--ink3)">↻ Reset</button>
@@ -204,9 +207,13 @@ tbody tr:hover{background:var(--panel2)}
 
     <div class="panel">
       <div class="panel-head">
-        <h2 id="team-status-title">Team status — today</h2>
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="btn btn-sm" id="ts-prev" onclick="navDay(-1)" title="Previous day" style="padding:4px 10px">‹</button>
+          <h2 id="team-status-title" style="min-width:210px;text-align:center">Team status — today</h2>
+          <button class="btn btn-sm" id="ts-next" onclick="navDay(1)" title="Next day" style="padding:4px 10px">›</button>
+        </div>
         <div class="legend">
-          <span><span class="sw" style="background:var(--am)"></span>Morning (shift→12nn)</span>
+          <span><span class="sw" style="background:var(--am)"></span>Morning (9am→12nn)</span>
           <span><span class="sw" style="background:var(--pm)"></span>Afternoon (12nn→6pm)</span>
         </div>
       </div>
@@ -366,7 +373,10 @@ function switchView(v,btn){
 
 /* ---------- dashboard ---------- */
 function renderDashboard(){
-  if(!viewDate)viewDate=todayStr();
+  if(!viewDate){
+    const ds=sortedDates();
+    viewDate=ds.length?ds[ds.length-1]:todayStr();  // open on most recent day that has data
+  }
   renderNav();
   renderKPIs();
   renderTrendChart();
@@ -403,6 +413,9 @@ function renderNav(){
   const atStart=idx<=0, atEnd=idx>=list.length-1;
   prev.style.opacity=atStart?'.35':'1';prev.style.pointerEvents=atStart?'none':'auto';
   next.style.opacity=atEnd?'.35':'1';next.style.pointerEvents=atEnd?'none':'auto';
+  const tp=document.getElementById('ts-prev'),tn=document.getElementById('ts-next');
+  if(tp){tp.style.opacity=atStart?'.35':'1';tp.style.pointerEvents=atStart?'none':'auto';}
+  if(tn){tn.style.opacity=atEnd?'.35':'1';tn.style.pointerEvents=atEnd?'none':'auto';}
 }
 function renderKPIs(){
   const vd=viewDate||todayStr();
@@ -538,6 +551,8 @@ async function saveReadings(){
     else{delete r.bal[tm.id][curCP];}
   });
   await saveReadingsStore();
+  viewDate=date;               // jump dashboard to the day just logged
+  renderDashboard();           // refresh immediately so the reading shows up
   toast(count+' balance'+(count===1?'':'s')+' saved · '+CP[curCP]+' · '+date);
 }
 
@@ -578,6 +593,35 @@ async function renameTeam(i,name){teams[i].name=name.trim()||teams[i].name;await
 async function setFx(v){const r=parseFloat(v);if(r>0){usdToEur=r;try{await window.storage.set('fx',String(r));}catch(e){}renderDashboard();toast('Rate updated · €/$ '+r);}}
 
 /* ---------- export ---------- */
+/* ---------- backup / restore (survives code updates) ---------- */
+function backupJSON(){
+  const payload={version:1,exported:new Date().toISOString(),teams,readings,fx:usdToEur};
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download='credit-monitor-backup-'+todayStr()+'.json';a.click();URL.revokeObjectURL(url);
+  toast('Backup saved · keep this file safe');
+}
+async function restoreJSON(input){
+  const file=input.files&&input.files[0];if(!file)return;
+  try{
+    const text=await file.text();
+    const data=JSON.parse(text);
+    if(!data||!Array.isArray(data.readings))throw new Error('Not a valid backup file');
+    if(!confirm('Restore this backup? It will replace all current data with the backup\'s '+data.readings.length+' day(s) of readings.'))
+      {input.value='';return;}
+    if(Array.isArray(data.teams)&&data.teams.length)teams=data.teams;
+    readings=data.readings;
+    if(data.fx&&parseFloat(data.fx)>0)usdToEur=parseFloat(data.fx);
+    await saveTeams();await saveReadingsStore();
+    try{await window.storage.set('fx',String(usdToEur));}catch(e){}
+    viewDate=null;
+    document.getElementById('fx-rate').value=usdToEur;
+    renderLogInputs();renderDashboard();
+    toast('Restored '+readings.length+' day(s) from backup ✓');
+  }catch(e){console.error(e);toast('Restore failed — invalid file',true);}
+  input.value='';
+}
+
 function exportCSV(){
   const dates=sortedDates();
   if(!dates.length){toast('Nothing to export yet',true);return;}
