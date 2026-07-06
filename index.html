@@ -7,7 +7,8 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="https://alcdn.msauth.net/browser/2.38.3/js/msal-browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@3/lib/msal-browser.min.js"></script>
+<script>if(typeof msal==='undefined'){document.write('<script src="https://unpkg.com/@azure/msal-browser@3/lib/msal-browser.min.js"><\/script>');}</script>
 <style>
 :root{
   --bg:#0e1117;--panel:#161b24;--panel2:#1c222d;--line:#252c38;--line2:#323b4a;
@@ -318,6 +319,11 @@ let account=null, siteId=null, listId=null;
 // map of composite key "date|team|checkpoint" -> SharePoint item id, for updates/deletes
 let itemIndex={};
 
+if(typeof msal==='undefined'){
+  const el=document.getElementById('login-status');
+  if(el)el.textContent='Sign-in library failed to load — check your network / ad-blocker and refresh.';
+  throw new Error('MSAL library not loaded');
+}
 const msalApp=new msal.PublicClientApplication({
   auth:{clientId:CLIENT_ID,authority:'https://login.microsoftonline.com/'+TENANT_ID,redirectUri:window.location.origin+window.location.pathname},
   cache:{cacheLocation:'localStorage'}
