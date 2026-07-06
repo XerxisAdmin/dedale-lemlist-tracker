@@ -305,7 +305,7 @@ const COST_PER_CREDIT_USD=0.01;
 let usdToEur=0.92; // editable
 const CREDIT_PER_5K_EUR=120, SEAT_EUR=69, BUDGET_EUR=1500;
 const PALETTE=['#3fd08a','#5b9bd5','#e0a83a','#b57ee0','#e85d5d','#4fd0d0','#d58a5b','#8a9be0'];
-let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null;
+let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null, loadedDate=null;
 
 /* ---------- Microsoft auth + SharePoint config ---------- */
 const CLIENT_ID='9114326a-0f63-45e6-8261-a66dd14d3b50';
@@ -641,7 +641,14 @@ function blankChart(ctx,msg){const c=ctx.getContext('2d');ctx.parentElement.quer
 function clearBlank(id){const p=document.getElementById(id).parentElement;p.querySelectorAll('.blank-msg').forEach(e=>e.remove());}
 
 /* ---------- logging ---------- */
-function setCheckpoint(cp,el){curCP=cp;document.querySelectorAll('.cp-tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');renderLogInputs();}
+function applyCheckpoint(cp){curCP=cp;document.querySelectorAll('.cp-tab').forEach(t=>t.classList.toggle('active',t.getAttribute('data-cp')===cp));renderLogInputs();}
+async function setCheckpoint(cp,el){
+  if(cp!==curCP){
+    const date=loadedDate||document.getElementById('log-date').value||todayStr();
+    await autoSave(date,curCP);   // save the checkpoint we're leaving before switching
+  }
+  applyCheckpoint(cp);
+}
 async function toggleBaseline(on){
   const date=document.getElementById('log-date').value||todayStr();
   let r=recFor(date);
@@ -661,6 +668,7 @@ async function toggleBaseline(on){
 }
 function renderLogInputs(){
   const date=document.getElementById('log-date').value||todayStr();
+  loadedDate=date;
   const r=recFor(date);
   const bf=document.getElementById('baseline-flag');if(bf)bf.checked=!!(r&&r.baseline);
   document.getElementById('team-inputs').innerHTML=teams.map(tm=>{
@@ -669,35 +677,57 @@ function renderLogInputs(){
       '<input type="number" min="0" placeholder="balance" id="in-'+tm.id+'" value="'+v+'"></div>';
   }).join('');
 }
-async function saveReadings(){
-  const date=document.getElementById('log-date').value||todayStr();
+// shared core: write the currently-entered inputs for a given date + checkpoint to SharePoint
+async function persistCheckpoint(date,cp){
   let r=recFor(date);
   if(!r){r={date,bal:{},baseline:false};readings.push(r);}
   const isBase=!!(document.getElementById('baseline-flag')&&document.getElementById('baseline-flag').checked);
   r.baseline=isBase;
   let count=0;
+  for(const tm of teams){
+    const el=document.getElementById('in-'+tm.id);
+    if(!el)continue;
+    const val=el.value.trim();
+    if(!r.bal[tm.id])r.bal[tm.id]={};
+    if(val!==''){
+      const num=Number(val);
+      r.bal[tm.id][cp]=num;
+      await spUpsertReading(date,tm.name,cp,num,isBase);
+      count++;
+    }else if(r.bal[tm.id][cp]!=null){
+      delete r.bal[tm.id][cp];
+      await spDeleteReading(date,tm.name,cp);
+    }
+  }
+  viewDate=date;
+  renderDashboard();
+  return count;
+}
+// manual save (Save readings button)
+async function saveReadings(){
+  const date=document.getElementById('log-date').value||todayStr();
   const btn=document.querySelector('#view-log .btn-primary');
   if(btn){btn.disabled=true;btn.textContent='Saving…';}
   try{
-    for(const tm of teams){
-      const el=document.getElementById('in-'+tm.id);
-      const val=el.value.trim();
-      if(!r.bal[tm.id])r.bal[tm.id]={};
-      if(val!==''){
-        const num=Number(val);
-        r.bal[tm.id][curCP]=num;
-        await spUpsertReading(date,tm.name,curCP,num,isBase);
-        count++;
-      }else if(r.bal[tm.id][curCP]!=null){
-        delete r.bal[tm.id][curCP];
-        await spDeleteReading(date,tm.name,curCP);
-      }
-    }
-    viewDate=date;
-    renderDashboard();
+    const count=await persistCheckpoint(date,curCP);
     toast(count+' balance'+(count===1?'':'s')+' saved · '+CP[curCP]+' · '+date);
   }catch(e){console.error(e);toast('Save failed — '+(e.message||''),true);}
   finally{if(btn){btn.disabled=false;btn.textContent='Save readings';}}
+}
+// quiet auto-save, used when leaving a checkpoint or date
+async function autoSave(date,cp){
+  try{
+    const count=await persistCheckpoint(date,cp);
+    if(count>0)toast('Auto-saved · '+CP[cp]+' · '+date);
+  }catch(e){console.error('auto-save failed',e);toast('Auto-save failed — '+(e.message||''),true);}
+}
+// date picker change: save the day we're leaving first, then load the new day
+async function onDateChange(){
+  const newDate=document.getElementById('log-date').value;
+  if(loadedDate&&newDate&&loadedDate!==newDate){
+    await autoSave(loadedDate,curCP);
+  }
+  renderLogInputs();
 }
 
 /* ---------- history ---------- */
@@ -721,7 +751,7 @@ function renderHistory(){
   document.getElementById('history-wrap').innerHTML=
     '<table><thead><tr><th>Date</th><th>Morning</th><th>Afternoon</th><th>Total used</th><th>Refills</th><th>Cost</th><th></th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
-function editDay(d){document.getElementById('log-date').value=d;switchView('log',document.querySelectorAll('.tabbar button')[1]);setCheckpoint('start',document.querySelector('.cp-tab'));renderLogInputs();toast('Editing '+d);}
+function editDay(d){document.getElementById('log-date').value=d;loadedDate=d;switchView('log',document.querySelectorAll('.tabbar button')[1]);applyCheckpoint('start');toast('Editing '+d);}
 async function delDay(d){
   if(!confirm('Delete all readings for '+d+'?'))return;
   const r=recFor(d);
@@ -884,7 +914,7 @@ async function startApp(){
     document.getElementById('app-shell').style.display='block';
     document.getElementById('log-date').value=todayStr();
     document.getElementById('fx-rate').value=usdToEur;
-    document.getElementById('log-date').addEventListener('change',renderLogInputs);
+    document.getElementById('log-date').addEventListener('change',onDateChange);
     renderLogInputs();
     renderDashboard();
   }catch(e){
