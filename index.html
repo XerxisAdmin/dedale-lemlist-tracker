@@ -393,7 +393,7 @@ async function loadAll(){
   readings=Object.values(byDate).sort((a,b)=>a.date<b.date?-1:1);
 }
 function defaultTeams(){
-  const names=['Avito','Eve','Celia','Han','Jenny','Reyna','PJ','Cielo'];
+  const names=['Avito','Eve','Celia','Han','Jenny','Reyna','PJ','Cielo','Trang','Lara'];
   return names.map((n,i)=>({id:'t'+(i+1),name:n,color:PALETTE[i%PALETTE.length]}));
 }
 
@@ -736,9 +736,30 @@ async function delDay(d){
 function openSettings(){
   document.getElementById('settings-teams').innerHTML=teams.map((tm,i)=>
     '<div style="display:flex;align-items:center;gap:11px;margin-bottom:10px"><span class="dot" style="background:'+tm.color+';width:12px;height:12px"></span>'+
-    '<input value="'+esc(tm.name)+'" onchange="renameTeam('+i+',this.value)" style="flex:1;background:var(--panel2);border:1px solid var(--line2);color:var(--ink);padding:8px 11px;border-radius:7px"></div>'
-  ).join('');
+    '<input value="'+esc(tm.name)+'" onchange="renameTeam('+i+',this.value)" style="flex:1;background:var(--panel2);border:1px solid var(--line2);color:var(--ink);padding:8px 11px;border-radius:7px">'+
+    '<button class="btn btn-sm btn-ghost" onclick="removeTeam('+i+')" title="Remove team" style="color:var(--danger)">✕</button></div>'
+  ).join('')+
+    '<button class="btn btn-sm" onclick="addTeam()" style="margin-top:6px">＋ Add team</button>';
   document.getElementById('settings-modal').classList.add('open');
+}
+async function addTeam(){
+  const name=(prompt('New team / lemlist account name:')||'').trim();
+  if(!name)return;
+  const usedIds=teams.map(t=>parseInt((t.id||'').replace('t',''))||0);
+  const nextId='t'+((usedIds.length?Math.max(...usedIds):0)+1);
+  teams.push({id:nextId,name,color:PALETTE[teams.length%PALETTE.length]});
+  await saveTeams();
+  openSettings();renderDashboard();renderLogInputs();
+  toast('Team added · '+name);
+}
+async function removeTeam(i){
+  if(!teams[i])return;
+  if(!confirm('Remove team "'+teams[i].name+'"?\n\nThis only removes it from the team list going forward — existing saved readings are not deleted.'))return;
+  const name=teams[i].name;
+  teams.splice(i,1);
+  await saveTeams();
+  openSettings();renderDashboard();renderLogInputs();
+  toast('Team removed · '+name);
 }
 function closeSettings(){document.getElementById('settings-modal').classList.remove('open');renderDashboard();renderLogInputs();}
 async function renameTeam(i,name){teams[i].name=name.trim()||teams[i].name;await saveTeams();}
