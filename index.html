@@ -170,6 +170,7 @@ tbody tr:hover{background:var(--panel2)}
     <button class="btn btn-sm" onclick="exportCSV()">↓ Export CSV</button>
     <button class="btn btn-sm btn-ghost" onclick="openSettings()">⚙ Teams</button>
     <button class="btn btn-sm btn-ghost" onclick="resetData()" title="Load July 1/2 demo data into SharePoint" style="color:var(--ink3)">↻ Load demo</button>
+    <button class="btn btn-sm btn-ghost" onclick="clearAllData()" title="Delete ALL readings from SharePoint and start fresh" style="color:var(--danger)">🗑 Clear all</button>
     <button class="btn btn-sm btn-ghost" onclick="signOut()" title="Sign out" style="color:var(--ink3)">⎋ Sign out</button>
   </div>
 </div>
@@ -827,6 +828,23 @@ async function resetData(){
     renderLogInputs();renderDashboard();
     toast('Demo data loaded into SharePoint ✓');
   }catch(e){console.error(e);toast('Load failed — '+(e.message||''),true);}
+}
+async function clearAllData(){
+  if(!confirm('Delete ALL logged readings from SharePoint?\n\nThis wipes every date so you can start fresh. Your team list and FX rate are kept.\n\nThis cannot be undone.'))return;
+  if(!confirm('Are you absolutely sure? This permanently removes every reading.'))return;
+  try{
+    // reading rows have keys like "date|team|checkpoint"; config rows (__fx__/__teams__) do not — skip them
+    const keys=Object.keys(itemIndex).filter(k=>k.indexOf('|')>-1);
+    let n=0;
+    for(const k of keys){
+      try{await spDeleteItem(itemIndex[k]);delete itemIndex[k];n++;}
+      catch(e){console.error('delete failed for',k,e);}
+    }
+    await loadAll();
+    viewDate=null;
+    renderLogInputs();renderDashboard();
+    toast(n+' reading'+(n===1?'':'s')+' cleared — start fresh ✓');
+  }catch(e){console.error(e);toast('Clear failed — '+(e.message||''),true);}
 }
 
 /* ---------- start app after login ---------- */
