@@ -678,47 +678,55 @@ function renderLogInputs(){
   }).join('');
 }
 // shared core: write the currently-entered inputs for a given date + checkpoint to SharePoint
-async function persistCheckpoint(date,cp){
+async function persistCheckpoint(date,cp,opts){
+  opts=opts||{};
+  const allowDelete=!!opts.allowDelete;
   let r=recFor(date);
   if(!r){r={date,bal:{},baseline:false};readings.push(r);}
   const isBase=!!(document.getElementById('baseline-flag')&&document.getElementById('baseline-flag').checked);
   r.baseline=isBase;
-  let count=0;
+  let count=0, errors=0;
   for(const tm of teams){
     const el=document.getElementById('in-'+tm.id);
     if(!el)continue;
     const val=el.value.trim();
     if(!r.bal[tm.id])r.bal[tm.id]={};
-    if(val!==''){
-      const num=Number(val);
-      r.bal[tm.id][cp]=num;
-      await spUpsertReading(date,tm.name,cp,num,isBase);
-      count++;
-    }else if(r.bal[tm.id][cp]!=null){
-      delete r.bal[tm.id][cp];
-      await spDeleteReading(date,tm.name,cp);
-    }
+    try{
+      if(val!==''){
+        const num=Number(val);
+        if(!isFinite(num))continue;
+        r.bal[tm.id][cp]=num;                       // set in memory first, so screen never loses it
+        await spUpsertReading(date,tm.name,cp,num,isBase);
+        count++;
+      }else if(allowDelete && r.bal[tm.id][cp]!=null){
+        // only the manual Save button clears values; auto-save never deletes
+        delete r.bal[tm.id][cp];
+        await spDeleteReading(date,tm.name,cp);
+      }
+    }catch(e){console.error('save failed for',tm.name,cp,e);errors++;}
   }
   viewDate=date;
   renderDashboard();
-  return count;
+  return {count,errors};
 }
-// manual save (Save readings button)
+// manual save (Save readings button) — this one CAN clear blanked fields
 async function saveReadings(){
   const date=document.getElementById('log-date').value||todayStr();
   const btn=document.querySelector('#view-log .btn-primary');
   if(btn){btn.disabled=true;btn.textContent='Saving…';}
   try{
-    const count=await persistCheckpoint(date,curCP);
-    toast(count+' balance'+(count===1?'':'s')+' saved · '+CP[curCP]+' · '+date);
+    const {count,errors}=await persistCheckpoint(date,curCP,{allowDelete:true});
+    if(errors>0)toast(count+' saved, '+errors+' failed · check connection',true);
+    else toast(count+' balance'+(count===1?'':'s')+' saved · '+CP[curCP]+' · '+date);
   }catch(e){console.error(e);toast('Save failed — '+(e.message||''),true);}
   finally{if(btn){btn.disabled=false;btn.textContent='Save readings';}}
 }
-// quiet auto-save, used when leaving a checkpoint or date
+// quiet auto-save (leaving a checkpoint or date) — write-only, never deletes
 async function autoSave(date,cp){
   try{
-    const count=await persistCheckpoint(date,cp);
-    if(count>0)toast('Auto-saved · '+CP[cp]+' · '+date);
+    const {count,errors}=await persistCheckpoint(date,cp,{allowDelete:false});
+    if(errors>0)toast('Auto-save: '+errors+' failed · check connection',true);
+    else if(count>0)toast('Auto-saved · '+CP[cp]+' · '+date);
   }catch(e){console.error('auto-save failed',e);toast('Auto-save failed — '+(e.message||''),true);}
 }
 // date picker change: save the day we're leaving first, then load the new day
