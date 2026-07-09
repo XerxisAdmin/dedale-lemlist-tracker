@@ -258,6 +258,7 @@ tbody tr:hover{background:var(--panel2)}
         <div class="field">
           <label>&nbsp;</label>
           <button class="btn btn-primary" onclick="saveReadings()">Save readings</button>
+          <span id="unsaved-hint" style="display:none;margin-left:10px;font-size:12px;color:var(--warn);font-family:'IBM Plex Mono',monospace">● unsaved — click Save</span>
         </div>
       </div>
       <div style="margin-top:14px;display:flex;align-items:center;gap:9px;padding-top:14px;border-top:1px solid var(--line)">
@@ -306,6 +307,8 @@ let usdToEur=0.92; // editable
 const CREDIT_PER_5K_EUR=120, SEAT_EUR=69, BUDGET_EUR=1500;
 const PALETTE=['#3fd08a','#5b9bd5','#e0a83a','#b57ee0','#e85d5d','#4fd0d0','#d58a5b','#8a9be0'];
 let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null, loadedDate=null;
+let saveLock=false; // serializes checkpoint/date saves to prevent race conditions
+let dirty=false; // true when balances are typed but not yet saved to SharePoint
 
 /* ---------- Microsoft auth + SharePoint config ---------- */
 const CLIENT_ID='9114326a-0f63-45e6-8261-a66dd14d3b50';
@@ -318,6 +321,7 @@ const SP_LIST='CreditReadings';
 let account=null, siteId=null, listId=null;
 // map of composite key "date|team|checkpoint" -> SharePoint item id, for updates/deletes
 let itemIndex={};
+let pendingCreates={}; // tracks in-flight create calls per key to avoid duplicate rows
 
 if(typeof msal==='undefined'){
   const el=document.getElementById('login-status');
@@ -368,6 +372,7 @@ async function resolveSiteAndList(){
 async function loadAll(){
   teams=defaultTeams();      // team list is a fixed default (editable in-session via Settings)
   readings=[];itemIndex={};
+  const dupes=[];            // orphaned duplicate row ids to clean up
   // pull all list items with fields
   let url=GRAPH+'/sites/'+siteId+'/lists/'+listId+'/items?expand=fields&$top=2000';
   const byDate={};
@@ -376,19 +381,26 @@ async function loadAll(){
     (page.value||[]).forEach(it=>{
       const f=it.fields||{};
       // config rows
-      if(f.Title==='__config_fx__'){const v=parseFloat(f.TeamName);if(v>0)usdToEur=v;itemIndex['__fx__']=it.id;return;}
-      if(f.Title==='__config_teams__'){try{const t=JSON.parse(f.TeamName);if(Array.isArray(t)&&t.length)teams=t;}catch(e){}itemIndex['__teams__']=it.id;return;}
+      if(f.Title==='__config_fx__'){const v=parseFloat(f.TeamName);if(v>0)usdToEur=v;if(itemIndex['__fx__'])dupes.push(it.id);else itemIndex['__fx__']=it.id;return;}
+      if(f.Title==='__config_teams__'){try{const t=JSON.parse(f.TeamName);if(Array.isArray(t)&&t.length)teams=t;}catch(e){}if(itemIndex['__teams__'])dupes.push(it.id);else itemIndex['__teams__']=it.id;return;}
       // reading rows
       const date=f.Title, cp=f.Checkpoint, tmName=f.TeamName, bal=f.Balance;
       if(!date||!cp||!tmName)return;
+      const key=date+'|'+tmName+'|'+cp;
+      if(itemIndex[key]){dupes.push(it.id);return;}   // duplicate of an already-seen key → mark for cleanup
       if(!byDate[date])byDate[date]={date,bal:{},baseline:!!f.IsBaseline};
       if(f.IsBaseline)byDate[date].baseline=true;
       const tm=teams.find(t=>t.name===tmName);const tid=tm?tm.id:tmName;
       if(!byDate[date].bal[tid])byDate[date].bal[tid]={};
       byDate[date].bal[tid][cp]=bal;
-      itemIndex[date+'|'+tmName+'|'+cp]=it.id;
+      itemIndex[key]=it.id;
     });
     url=page['@odata.nextLink']||null;
+  }
+  // best-effort cleanup of orphaned duplicates (non-blocking failures)
+  if(dupes.length){
+    for(const id of dupes){try{await spDeleteItem(id);}catch(e){console.error('dupe cleanup failed',id,e);}}
+    if(dupes.length)console.log('cleaned '+dupes.length+' duplicate row(s)');
   }
   readings=Object.values(byDate).sort((a,b)=>a.date<b.date?-1:1);
 }
@@ -414,8 +426,16 @@ async function spDeleteItem(id){
 async function spUpsertReading(date,teamName,cp,balance,isBaseline){
   const key=date+'|'+teamName+'|'+cp;
   const fields={Title:date,Checkpoint:cp,TeamName:teamName,Balance:balance,IsBaseline:!!isBaseline};
-  if(itemIndex[key])await spUpdateItem(itemIndex[key],fields);
-  else itemIndex[key]=await spCreateItem(fields);
+  // If a create for this key is already in flight, wait for it so we UPDATE rather than create a duplicate.
+  if(pendingCreates[key]){try{await pendingCreates[key];}catch(e){}}
+  if(itemIndex[key]){
+    await spUpdateItem(itemIndex[key],fields);
+  }else{
+    const p=spCreateItem(fields);
+    pendingCreates[key]=p;
+    try{itemIndex[key]=await p;}
+    finally{delete pendingCreates[key];}
+  }
 }
 async function spDeleteReading(date,teamName,cp){
   const key=date+'|'+teamName+'|'+cp;
@@ -643,11 +663,23 @@ function clearBlank(id){const p=document.getElementById(id).parentElement;p.quer
 /* ---------- logging ---------- */
 function applyCheckpoint(cp){curCP=cp;document.querySelectorAll('.cp-tab').forEach(t=>t.classList.toggle('active',t.getAttribute('data-cp')===cp));renderLogInputs();}
 async function setCheckpoint(cp,el){
-  if(cp!==curCP){
-    const date=loadedDate||document.getElementById('log-date').value||todayStr();
-    await autoSave(date,curCP);   // save the checkpoint we're leaving before switching
-  }
+  if(cp===curCP)return;
+  captureCurrentInputs();   // keep typed values in memory (NOT written to SharePoint)
   applyCheckpoint(cp);
+}
+// Snapshot the currently-visible inputs into the in-memory model (no network write).
+function captureCurrentInputs(){
+  const date=loadedDate||document.getElementById('log-date').value||todayStr();
+  let r=recFor(date);
+  if(!r){r={date,bal:{},baseline:false};readings.push(r);}
+  teams.forEach(tm=>{
+    const el=document.getElementById('in-'+tm.id);
+    if(!el)return;
+    if(!r.bal[tm.id])r.bal[tm.id]={};
+    const val=el.value.trim();
+    if(val!==''){const num=Number(val);if(isFinite(num))r.bal[tm.id][curCP]=num;}
+    else delete r.bal[tm.id][curCP];
+  });
 }
 async function toggleBaseline(on){
   const date=document.getElementById('log-date').value||todayStr();
@@ -674,9 +706,10 @@ function renderLogInputs(){
   document.getElementById('team-inputs').innerHTML=teams.map(tm=>{
     const v=r&&r.bal[tm.id]&&r.bal[tm.id][curCP]!=null?r.bal[tm.id][curCP]:'';
     return '<div class="team-input"><label><span class="dot" style="background:'+tm.color+'"></span>'+esc(tm.name)+'</label>'+
-      '<input type="number" min="0" placeholder="balance" id="in-'+tm.id+'" value="'+v+'"></div>';
+      '<input type="number" min="0" placeholder="balance" id="in-'+tm.id+'" value="'+v+'" oninput="markDirty()"></div>';
   }).join('');
 }
+function markDirty(){dirty=true;const d=document.getElementById('unsaved-hint');if(d)d.style.display='inline';}
 // shared core: write the currently-entered inputs for a given date + checkpoint to SharePoint
 async function persistCheckpoint(date,cp,opts){
   opts=opts||{};
@@ -685,25 +718,32 @@ async function persistCheckpoint(date,cp,opts){
   if(!r){r={date,bal:{},baseline:false};readings.push(r);}
   const isBase=!!(document.getElementById('baseline-flag')&&document.getElementById('baseline-flag').checked);
   r.baseline=isBase;
-  let count=0, errors=0;
-  for(const tm of teams){
+  // SNAPSHOT all input values synchronously FIRST, before any await/repaint can change the DOM.
+  const snapshot=teams.map(tm=>{
     const el=document.getElementById('in-'+tm.id);
-    if(!el)continue;
-    const val=el.value.trim();
-    if(!r.bal[tm.id])r.bal[tm.id]={};
+    return {tm,present:!!el,val:el?el.value.trim():''};
+  });
+  // Commit to in-memory model immediately (so the screen never loses values), then write to SP.
+  snapshot.forEach(s=>{
+    if(!s.present)return;
+    if(!r.bal[s.tm.id])r.bal[s.tm.id]={};
+    if(s.val!==''){const num=Number(s.val);if(isFinite(num))r.bal[s.tm.id][cp]=num;}
+    else if(allowDelete && r.bal[s.tm.id][cp]!=null){delete r.bal[s.tm.id][cp];}
+  });
+  let count=0, errors=0;
+  for(const s of snapshot){
+    if(!s.present)continue;
     try{
-      if(val!==''){
-        const num=Number(val);
+      if(s.val!==''){
+        const num=Number(s.val);
         if(!isFinite(num))continue;
-        r.bal[tm.id][cp]=num;                       // set in memory first, so screen never loses it
-        await spUpsertReading(date,tm.name,cp,num,isBase);
+        await spUpsertReading(date,s.tm.name,cp,num,isBase);
         count++;
-      }else if(allowDelete && r.bal[tm.id][cp]!=null){
-        // only the manual Save button clears values; auto-save never deletes
-        delete r.bal[tm.id][cp];
-        await spDeleteReading(date,tm.name,cp);
+      }else if(allowDelete && recFor(date).bal[s.tm.id] && recFor(date).bal[s.tm.id][cp]==null){
+        // value was blanked and we've removed it from memory; delete from SP too
+        await spDeleteReading(date,s.tm.name,cp);
       }
-    }catch(e){console.error('save failed for',tm.name,cp,e);errors++;}
+    }catch(e){console.error('save failed for',s.tm.name,cp,e);errors++;}
   }
   viewDate=date;
   renderDashboard();
@@ -711,30 +751,39 @@ async function persistCheckpoint(date,cp,opts){
 }
 // manual save (Save readings button) — this one CAN clear blanked fields
 async function saveReadings(){
-  const date=document.getElementById('log-date').value||todayStr();
+  if(saveLock){toast('Please wait — saving…');return;}
+  saveLock=true;
+  captureCurrentInputs();                       // fold the visible inputs into memory first
+  const date=loadedDate||document.getElementById('log-date').value||todayStr();
+  const r=recFor(date)||{date,bal:{},baseline:false};
+  const isBase=!!(document.getElementById('baseline-flag')&&document.getElementById('baseline-flag').checked);
+  r.baseline=isBase;
   const btn=document.querySelector('#view-log .btn-primary');
   if(btn){btn.disabled=true;btn.textContent='Saving…';}
+  let count=0,errors=0;
   try{
-    const {count,errors}=await persistCheckpoint(date,curCP,{allowDelete:true});
-    if(errors>0)toast(count+' saved, '+errors+' failed · check connection',true);
-    else toast(count+' balance'+(count===1?'':'s')+' saved · '+CP[curCP]+' · '+date);
+    // persist EVERY checkpoint held in memory for this date (not just the visible one)
+    for(const tm of teams){
+      const b=r.bal[tm.id]||{};
+      for(const cp of ['start','noon','end']){
+        if(b[cp]!=null){
+          try{await spUpsertReading(date,tm.name,cp,b[cp],isBase);count++;}
+          catch(e){console.error('save failed',tm.name,cp,e);errors++;}
+        }
+      }
+    }
+    viewDate=date;renderDashboard();
+    if(errors>0){toast(count+' saved, '+errors+' failed · check connection',true);}
+    else{
+      dirty=false;const dh=document.getElementById('unsaved-hint');if(dh)dh.style.display='none';
+      toast(count+' balance'+(count===1?'':'s')+' saved · '+date);
+    }
   }catch(e){console.error(e);toast('Save failed — '+(e.message||''),true);}
-  finally{if(btn){btn.disabled=false;btn.textContent='Save readings';}}
+  finally{saveLock=false;if(btn){btn.disabled=false;btn.textContent='Save readings';}}
 }
-// quiet auto-save (leaving a checkpoint or date) — write-only, never deletes
-async function autoSave(date,cp){
-  try{
-    const {count,errors}=await persistCheckpoint(date,cp,{allowDelete:false});
-    if(errors>0)toast('Auto-save: '+errors+' failed · check connection',true);
-    else if(count>0)toast('Auto-saved · '+CP[cp]+' · '+date);
-  }catch(e){console.error('auto-save failed',e);toast('Auto-save failed — '+(e.message||''),true);}
-}
-// date picker change: save the day we're leaving first, then load the new day
-async function onDateChange(){
-  const newDate=document.getElementById('log-date').value;
-  if(loadedDate&&newDate&&loadedDate!==newDate){
-    await autoSave(loadedDate,curCP);
-  }
+// date picker change: keep typed values in memory (no write), then load the new day
+function onDateChange(){
+  captureCurrentInputs();
   renderLogInputs();
 }
 
@@ -914,6 +963,7 @@ async function clearAllData(){
 
 /* ---------- start app after login ---------- */
 async function startApp(){
+  window.addEventListener('beforeunload',function(e){if(dirty){e.preventDefault();e.returnValue='';}});
   document.getElementById('login-status').textContent='LOADING DATA…';
   try{
     await resolveSiteAndList();
