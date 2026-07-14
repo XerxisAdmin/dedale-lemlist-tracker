@@ -161,7 +161,7 @@ tbody tr:hover{background:var(--panel2)}
     <div class="glyph">◈</div>
     <div>
       <h1>Credit Monitor</h1>
-      <div class="sub">lemlist consumption · PH planners · 8 teams</div>
+      <div class="sub" id="teams-count-label">lemlist consumption · PH planners</div>
     </div>
   </div>
   <div class="topbar-actions">
@@ -206,6 +206,15 @@ tbody tr:hover{background:var(--panel2)}
       <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
         <label style="font-size:12px;color:var(--ink3);font-family:'IBM Plex Mono',monospace">€/$ rate</label>
         <input type="number" step="0.01" min="0" id="fx-rate" value="0.92" onchange="setFx(this.value)" style="width:76px;background:var(--panel2);border:1px solid var(--line2);color:var(--ink);padding:6px 9px;border-radius:7px;font-family:'IBM Plex Mono',monospace;font-size:13px">
+      </div>
+      <div style="flex-basis:100%">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <span style="font-size:12px;color:var(--ink2)" id="budget-bar-title">Month to date</span>
+          <span class="mono" style="font-size:13px" id="budget-bar-label">—</span>
+        </div>
+        <div style="height:8px;border-radius:4px;background:var(--line);overflow:hidden">
+          <div id="budget-bar-fill" style="height:100%;border-radius:4px;background:var(--credit);width:0%;transition:width .3s"></div>
+        </div>
       </div>
     </div>
 
@@ -265,6 +274,13 @@ tbody tr:hover{background:var(--panel2)}
         <input type="checkbox" id="baseline-flag" onchange="toggleBaseline(this.checked)" style="width:16px;height:16px;accent-color:var(--warn);cursor:pointer">
         <label for="baseline-flag" style="font-size:13px;color:var(--ink2);cursor:pointer;margin:0">Mark as <b style="color:var(--warn)">baseline / replenished day</b> — a wildcard reading (e.g. accounts topped up mid-day). Consumption is not computed for this date; it just sets a reference point.</label>
       </div>
+      <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
+        <label style="display:block;font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--ink3);font-weight:600;margin-bottom:6px;font-family:'IBM Plex Mono',monospace">Paste balances (one per line — "Name 1234", or just numbers in team order)</label>
+        <div style="display:flex;gap:10px;align-items:flex-start">
+          <textarea id="bulk-paste" rows="3" placeholder="Avito 119&#10;Eve 4400&#10;Celia 4900" style="flex:1;background:var(--panel2);border:1px solid var(--line2);color:var(--ink);padding:9px 11px;border-radius:8px;font-family:'IBM Plex Mono',monospace;font-size:13px;resize:vertical"></textarea>
+          <button class="btn btn-sm" onclick="fillFromPaste()">Fill fields</button>
+        </div>
+      </div>
       <div class="team-input-grid" id="team-inputs"></div>
     </div>
     <div class="panel">
@@ -275,6 +291,10 @@ tbody tr:hover{background:var(--panel2)}
 
   <!-- ============ HISTORY ============ -->
   <div class="view" id="view-history">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head"><h2>Monthly summary</h2></div>
+      <div id="monthly-summary-wrap"></div>
+    </div>
     <div class="panel">
       <div class="panel-head">
         <h2>Reading history</h2>
@@ -305,6 +325,7 @@ const CP={start:'9 AM CET',noon:'12 noon CET',end:'6 PM CET'};
 const COST_PER_CREDIT_USD=0.01;
 let usdToEur=0.92; // editable
 const CREDIT_PER_5K_EUR=120, SEAT_EUR=69, BUDGET_EUR=1500;
+const ADMIN_PIN='2468'; // change me — gates destructive actions like Clear All
 const PALETTE=['#3fd08a','#5b9bd5','#e0a83a','#b57ee0','#e85d5d','#4fd0d0','#d58a5b','#8a9be0'];
 let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null, loadedDate=null;
 let saveLock=false; // serializes checkpoint/date saves to prevent race conditions
@@ -408,6 +429,10 @@ function defaultTeams(){
   const names=['Avito','Eve','Celia','Han','Jenny','Reyna','PJ','Cielo','Trang','Lara'];
   return names.map((n,i)=>({id:'t'+(i+1),name:n,color:PALETTE[i%PALETTE.length]}));
 }
+function updateTeamsCountLabel(){
+  const el=document.getElementById('teams-count-label');
+  if(el)el.textContent='lemlist consumption · PH planners · '+teams.length+' team'+(teams.length===1?'':'s');
+}
 
 /* ---------- SharePoint write helpers ---------- */
 async function spCreateItem(fields){
@@ -487,6 +512,19 @@ function teamConsumption(date,tmId){
   return {am,pm,total:am+pm};
 }
 function sortedDates(){return [...new Set(readings.map(r=>r.date))].sort();}
+// per-team average daily consumption across all tracked (non-baseline) days that have data for that team
+function teamAvgBurn(tmId){
+  const vals=sortedDates().map(d=>teamConsumption(d,tmId).total).filter(v=>v>0);
+  if(!vals.length)return 0;
+  return vals.reduce((s,v)=>s+v,0)/vals.length;
+}
+// per-team projected runway in days, given a current remaining balance
+function teamRunway(tmId,remaining){
+  if(remaining==null)return null;
+  const avg=teamAvgBurn(tmId);
+  if(!(avg>0))return null;
+  return Math.floor(remaining/avg);
+}
 
 /* ---------- refill detection ---------- */
 // Detects positive jumps between consecutive checkpoints within a day = credits added.
@@ -521,6 +559,7 @@ function renderDashboard(){
   }
   renderNav();
   renderKPIs();
+  renderBudgetBar();
   renderTrendChart();
   renderTeamChart();
   renderTeamTable();
@@ -597,6 +636,25 @@ function renderKPIs(){
     '<div class="kpi '+k.cls+'"><div class="accent-bar"></div><div class="cap">'+k.cap+'</div><div class="big num">'+k.big+'</div><div class="foot">'+k.foot+'</div></div>'
   ).join('');
 }
+function renderBudgetBar(){
+  const wrap=document.getElementById('budget-bar-label');
+  if(!wrap)return;
+  const monthPrefix=todayStr().substring(0,7); // current real calendar month, YYYY-MM
+  const monthLabel=new Date(todayStr()+'T00:00:00').toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  let credits=0;
+  sortedDates().forEach(d=>{
+    if(!d.startsWith(monthPrefix))return;
+    const c=consumptionFor(d);
+    if(c&&!c.baseline)credits+=c.total;
+  });
+  const spentEUR=costEUR(credits);
+  const pct=Math.min(100,(spentEUR/BUDGET_EUR)*100);
+  document.getElementById('budget-bar-title').textContent=monthLabel;
+  document.getElementById('budget-bar-label').textContent=eur(spentEUR)+' of '+eur(BUDGET_EUR)+' ('+pct.toFixed(0)+'%)';
+  const fill=document.getElementById('budget-bar-fill');
+  fill.style.width=pct+'%';
+  fill.style.background=pct>=100?'var(--danger)':(pct>=80?'var(--warn)':'var(--credit)');
+}
 function renderTrendChart(){
   const dates=sortedDates().slice(-14);
   document.getElementById('trend-range').textContent='last '+dates.length+' day'+(dates.length===1?'':'s');
@@ -636,6 +694,12 @@ function renderTeamTable(){
     if(!r||remaining==null)status='<span class="pill warn">no reading</span>';
     const rf=teamRefill(today,tm.id);
     if(rf.added>0)status+=' <span class="pill" style="background:#0c2a2a;color:#4fd0d0" title="Balance rose '+fmt(rf.added)+' \u2014 credits added">⟳ +'+fmt(rf.added)+'</span>';
+    const runwayDays=teamRunway(tm.id,remaining);
+    let runwayCell='<span style="color:var(--ink3)">—</span>';
+    if(runwayDays!=null){
+      const rColor=runwayDays<=3?'var(--danger)':(runwayDays<=7?'var(--warn)':'var(--ink2)');
+      runwayCell='<span style="color:'+rColor+';font-weight:600">'+runwayDays+'d</span>';
+    }
     return '<tr>'+
       '<td><span class="team-name"><span class="dot" style="background:'+tm.color+'"></span>'+esc(tm.name)+'</span></td>'+
       '<td class="num">'+(b.start!=null?fmt(b.start):'—')+'</td>'+
@@ -644,11 +708,12 @@ function renderTeamTable(){
       '<td class="num" style="font-weight:600">'+(total>0?fmt(total):'—')+'</td>'+
       '<td>'+(total>0?'<div class="split" title="AM '+fmt(c.am)+' · PM '+fmt(c.pm)+'"><div class="am" style="width:'+amPct+'%"></div><div class="pm" style="width:'+pmPct+'%"></div></div>':'<span style="color:var(--ink3)">—</span>')+'</td>'+
       '<td class="num" style="color:var(--credit)">'+(total>0?money(total):'—')+'</td>'+
+      '<td class="num">'+runwayCell+'</td>'+
       '<td>'+status+'</td>'+
     '</tr>';
   }).join('');
   document.getElementById('team-table-wrap').innerHTML=
-    '<table><thead><tr><th>Team</th><th>9am</th><th>12nn</th><th>6pm</th><th>Used</th><th>AM / PM split</th><th>Cost</th><th>Status</th></tr></thead><tbody>'+rows+'</tbody></table>';
+    '<table><thead><tr><th>Team</th><th>9am</th><th>12nn</th><th>6pm</th><th>Used</th><th>AM / PM split</th><th>Cost</th><th>Runway</th><th>Status</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 
 /* ---------- chart utilities ---------- */
@@ -710,6 +775,41 @@ function renderLogInputs(){
   }).join('');
 }
 function markDirty(){dirty=true;const d=document.getElementById('unsaved-hint');if(d)d.style.display='inline';}
+// Parse pasted balances into the visible team input fields.
+// Tries name-matched lines first ("Avito 119"); falls back to positional order if no names match.
+function fillFromPaste(){
+  const ta=document.getElementById('bulk-paste');
+  const lines=(ta.value||'').split(/\r?\n/).map(l=>l.trim()).filter(l=>l!=='');
+  if(!lines.length){toast('Paste something first',true);return;}
+  const byId={};let matchedAny=false;
+  lines.forEach(line=>{
+    const nums=line.match(/-?\d+(\.\d+)?/g);
+    if(!nums)return;
+    const num=nums[nums.length-1];
+    const tm=teams.find(t=>line.toLowerCase().includes(t.name.toLowerCase()));
+    if(tm){byId[tm.id]=num;matchedAny=true;}
+  });
+  let filled=0;
+  if(matchedAny){
+    teams.forEach(tm=>{
+      if(byId[tm.id]==null)return;
+      const el=document.getElementById('in-'+tm.id);
+      if(el){el.value=byId[tm.id];filled++;}
+    });
+  }else{
+    teams.forEach((tm,i)=>{
+      if(i>=lines.length)return;
+      const nums=lines[i].match(/-?\d+(\.\d+)?/g);
+      if(!nums)return;
+      const el=document.getElementById('in-'+tm.id);
+      if(el){el.value=nums[nums.length-1];filled++;}
+    });
+  }
+  if(!filled){toast('Could not read any balances from that paste',true);return;}
+  markDirty();
+  ta.value='';
+  toast('Filled '+filled+' field'+(filled===1?'':'s')+' from paste — review, then Save');
+}
 // shared core: write the currently-entered inputs for a given date + checkpoint to SharePoint
 async function persistCheckpoint(date,cp,opts){
   opts=opts||{};
@@ -788,7 +888,36 @@ function onDateChange(){
 }
 
 /* ---------- history ---------- */
+function renderMonthlySummary(){
+  const wrap=document.getElementById('monthly-summary-wrap');
+  if(!wrap)return;
+  const dates=sortedDates();
+  if(!dates.length){wrap.innerHTML='<div class="empty" style="padding:20px"><p>No readings logged yet.</p></div>';return;}
+  const byMonth={};
+  dates.forEach(d=>{
+    const m=d.substring(0,7);
+    const c=consumptionFor(d);
+    if(!byMonth[m])byMonth[m]={days:0,credits:0,refill:0};
+    if(c&&!c.baseline){byMonth[m].days++;byMonth[m].credits+=c.total;}
+    const rf=refillFor(d);
+    if(rf.added>0)byMonth[m].refill+=rf.added;
+  });
+  const months=Object.keys(byMonth).sort().reverse();
+  const rows=months.map(m=>{
+    const s=byMonth[m];
+    const label=new Date(m+'-01T00:00:00').toLocaleDateString(undefined,{month:'long',year:'numeric'});
+    const pct=Math.min(100,(costEUR(s.credits)/BUDGET_EUR)*100);
+    return '<tr><td class="num" style="font-weight:600">'+label+'</td>'+
+      '<td class="num">'+s.days+'</td>'+
+      '<td class="num">'+fmt(s.credits)+'</td>'+
+      '<td class="num" style="color:var(--credit)">'+money(s.credits)+'</td>'+
+      '<td class="num">'+(s.refill>0?'⟳ '+fmt(s.refill):'—')+'</td>'+
+      '<td class="num" style="color:'+(pct>=100?'var(--danger)':(pct>=80?'var(--warn)':'var(--ink2)'))+'">'+pct.toFixed(0)+'% of budget</td></tr>';
+  }).join('');
+  wrap.innerHTML='<table><thead><tr><th>Month</th><th>Days logged</th><th>Credits used</th><th>Cost</th><th>Refills</th><th>Budget</th></tr></thead><tbody>'+rows+'</tbody></table>';
+}
 function renderHistory(){
+  renderMonthlySummary();
   const dates=sortedDates().reverse();
   document.getElementById('history-count').textContent=dates.length+' day'+(dates.length===1?'':'s');
   if(!dates.length){document.getElementById('history-wrap').innerHTML='<div class="empty"><div class="icon">◈</div><p>No readings logged yet.</p><p style="color:var(--ink3);font-size:13px">Head to Log Readings to record your first shift.</p></div>';return;}
@@ -836,7 +965,7 @@ async function addTeam(){
   const nextId='t'+((usedIds.length?Math.max(...usedIds):0)+1);
   teams.push({id:nextId,name,color:PALETTE[teams.length%PALETTE.length]});
   await saveTeams();
-  openSettings();renderDashboard();renderLogInputs();
+  openSettings();updateTeamsCountLabel();renderDashboard();renderLogInputs();
   toast('Team added · '+name);
 }
 async function removeTeam(i){
@@ -845,7 +974,7 @@ async function removeTeam(i){
   const name=teams[i].name;
   teams.splice(i,1);
   await saveTeams();
-  openSettings();renderDashboard();renderLogInputs();
+  openSettings();updateTeamsCountLabel();renderDashboard();renderLogInputs();
   toast('Team removed · '+name);
 }
 function closeSettings(){document.getElementById('settings-modal').classList.remove('open');renderDashboard();renderLogInputs();}
@@ -944,8 +1073,10 @@ async function resetData(){
   }catch(e){console.error(e);toast('Load failed — '+(e.message||''),true);}
 }
 async function clearAllData(){
+  const pin=prompt('Enter admin PIN to clear all readings:');
+  if(pin===null)return;
+  if(pin!==ADMIN_PIN){alert('Incorrect PIN.');return;}
   if(!confirm('Delete ALL logged readings from SharePoint?\n\nThis wipes every date so you can start fresh. Your team list and FX rate are kept.\n\nThis cannot be undone.'))return;
-  if(!confirm('Are you absolutely sure? This permanently removes every reading.'))return;
   try{
     // reading rows have keys like "date|team|checkpoint"; config rows (__fx__/__teams__) do not — skip them
     const keys=Object.keys(itemIndex).filter(k=>k.indexOf('|')>-1);
@@ -973,6 +1104,7 @@ async function startApp(){
     document.getElementById('log-date').value=todayStr();
     document.getElementById('fx-rate').value=usdToEur;
     document.getElementById('log-date').addEventListener('change',onDateChange);
+    updateTeamsCountLabel();
     renderLogInputs();
     renderDashboard();
   }catch(e){
