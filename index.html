@@ -183,6 +183,7 @@ tbody tr:hover{background:var(--panel2)}
     <button class="active" onclick="switchView('dashboard',this)">Dashboard</button>
     <button onclick="switchView('log',this)">Log Readings</button>
     <button onclick="switchView('history',this)">History</button>
+    <button onclick="switchView('annual',this)">Annual Overview</button>
   </div>
 
   <!-- ============ DASHBOARD ============ -->
@@ -304,6 +305,23 @@ tbody tr:hover{background:var(--panel2)}
     </div>
   </div>
 
+  <!-- ============ ANNUAL OVERVIEW ============ -->
+  <div class="view" id="view-annual">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head">
+        <h2>Annual overview — planning team</h2>
+        <span class="hint" id="annual-year-label"></span>
+      </div>
+      <p style="color:var(--ink2);font-size:13px;margin:0 0 16px">Cost per month for the planning team across the year. Jan–Jun are imported historical actuals; later months fill in automatically once a full month of daily readings is collected.</p>
+      <div class="kpis" id="annual-kpis" style="margin-bottom:20px"></div>
+      <div id="annual-table-wrap"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>Monthly cost trend</h2></div>
+      <div id="annual-chart-wrap"></div>
+    </div>
+  </div>
+
 </div>
 
 <!-- Settings modal -->
@@ -325,6 +343,18 @@ const CP={start:'9 AM CET',noon:'12 noon CET',end:'6 PM CET'};
 const COST_PER_CREDIT_USD=0.01;
 let usdToEur=0.92; // editable
 const CREDIT_PER_5K_EUR=120, SEAT_EUR=69, BUDGET_EUR=1500;
+// Planning-team lemlist cost history (EUR), imported from the manual monthly tracker.
+// Jan–Jun 2026 are actuals entered by hand; later months fill in automatically from
+// live daily readings once a full month is collected. Scope: PLANNING TEAM ONLY.
+const ANNUAL_YEAR = 2026;
+const HISTORICAL_MONTHLY_EUR = {
+  '2026-01': 962.40,
+  '2026-02': 1142.40,
+  '2026-03': 1202.40,
+  '2026-04': 579.60,
+  '2026-05': 1060.66,
+  '2026-06': 1599.60
+};
 const ADMIN_PIN='2468'; // change me — gates destructive actions like Clear All
 const PALETTE=['#3fd08a','#5b9bd5','#e0a83a','#b57ee0','#e85d5d','#4fd0d0','#d58a5b','#8a9be0'];
 let teams=[], readings=[], curCP='start', trendChart=null, teamChart=null, viewDate=null, loadedDate=null;
@@ -549,6 +579,7 @@ function switchView(v,btn){
   btn.classList.add('active');
   if(v==='dashboard')renderDashboard();
   if(v==='history')renderHistory();
+  if(v==='annual')renderAnnual();
 }
 
 /* ---------- dashboard ---------- */
@@ -888,6 +919,85 @@ function onDateChange(){
 }
 
 /* ---------- history ---------- */
+// Build the planning-team cost for a given YYYY-MM from live daily readings (planning team only).
+function liveMonthlyEUR(monthPrefix){
+  const planning=teams.find(t=>/planning|plan/i.test(t.name));
+  let credits=0,hasData=false;
+  sortedDates().forEach(d=>{
+    if(!d.startsWith(monthPrefix))return;
+    const c=consumptionFor(d);
+    if(!c||c.baseline)return;
+    if(planning){
+      const tc=teamConsumption(d,planning.id);
+      if(tc&&tc.total>0){credits+=tc.total;hasData=true;}
+    }
+  });
+  return hasData?costEUR(credits):null;
+}
+function renderAnnual(){
+  document.getElementById('annual-year-label').textContent=ANNUAL_YEAR+' · planning team';
+  const months=[];
+  for(let m=1;m<=12;m++){
+    const key=ANNUAL_YEAR+'-'+String(m).padStart(2,'0');
+    const label=new Date(key+'-01T00:00:00').toLocaleDateString(undefined,{month:'long'});
+    let eurVal=null,source='';
+    if(HISTORICAL_MONTHLY_EUR[key]!=null){eurVal=HISTORICAL_MONTHLY_EUR[key];source='imported';}
+    else{const live=liveMonthlyEUR(key);if(live!=null){eurVal=live;source='live';}}
+    months.push({key,label,eur:eurVal,source});
+  }
+  const filled=months.filter(m=>m.eur!=null);
+  const total=filled.reduce((s,m)=>s+m.eur,0);
+  const avg=filled.length?total/filled.length:0;
+  const hi=filled.length?filled.reduce((a,b)=>b.eur>a.eur?b:a):null;
+  const lo=filled.length?filled.reduce((a,b)=>b.eur<a.eur?b:a):null;
+
+  // KPIs
+  document.getElementById('annual-kpis').innerHTML=
+    '<div class="kpi cost"><div class="accent-bar"></div><div class="cap">Year to date</div><div class="big">'+eur(total)+'</div><div class="foot">'+filled.length+' month'+(filled.length===1?'':'s')+' recorded</div></div>'+
+    '<div class="kpi rate"><div class="accent-bar"></div><div class="cap">Monthly average</div><div class="big">'+eur(avg)+'</div><div class="foot">across recorded months</div></div>'+
+    '<div class="kpi runout"><div class="accent-bar"></div><div class="cap">Highest month</div><div class="big">'+(hi?eur(hi.eur):'—')+'</div><div class="foot">'+(hi?hi.label:'—')+'</div></div>'+
+    '<div class="kpi refill"><div class="accent-bar"></div><div class="cap">Lowest month</div><div class="big">'+(lo?eur(lo.eur):'—')+'</div><div class="foot">'+(lo?lo.label:'—')+'</div></div>';
+
+  // Table with month-over-month change
+  let prev=null;
+  const rows=months.map(m=>{
+    if(m.eur==null){
+      return '<tr style="opacity:.5"><td class="num" style="font-weight:600">'+m.label+'</td><td class="num">—</td><td class="num">pending</td><td class="num">—</td></tr>';
+    }
+    let chg='—';
+    if(prev!=null&&prev>0){
+      const pct=((m.eur-prev)/prev)*100;
+      const col=pct>0?'var(--danger)':(pct<0?'var(--credit)':'var(--ink3)');
+      chg='<span style="color:'+col+'">'+(pct>0?'▲ +':(pct<0?'▼ ':''))+pct.toFixed(0)+'%</span>';
+    }
+    const badge=m.source==='imported'
+      ?'<span class="pill" style="background:var(--panel2);color:var(--ink3)">imported</span>'
+      :'<span class="pill" style="background:#0c2a2a;color:#4fd0d0">live</span>';
+    const row='<tr><td class="num" style="font-weight:600">'+m.label+'</td>'+
+      '<td class="num" style="color:var(--credit);font-weight:600">'+eur(m.eur)+'</td>'+
+      '<td class="num">'+badge+'</td>'+
+      '<td class="num">'+chg+'</td></tr>';
+    prev=m.eur;
+    return row;
+  }).join('');
+  document.getElementById('annual-table-wrap').innerHTML=
+    '<table><thead><tr><th>Month</th><th>Cost</th><th>Source</th><th>vs prior month</th></tr></thead><tbody>'+rows+'</tbody></table>';
+
+  // Simple bar chart
+  const maxEur=filled.length?Math.max(...filled.map(m=>m.eur)):1;
+  const bars=months.map(m=>{
+    const h=m.eur!=null?Math.max(4,(m.eur/maxEur)*160):0;
+    const barColor=m.source==='imported'?'var(--credit)':'#4fd0d0';
+    return '<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;min-width:0">'+
+      '<div style="font-size:10px;color:var(--ink3);font-family:\'IBM Plex Mono\',monospace;height:14px">'+(m.eur!=null?Math.round(m.eur):'')+'</div>'+
+      '<div style="width:60%;height:'+h+'px;background:'+barColor+';border-radius:3px 3px 0 0;'+(m.eur==null?'border:1px dashed var(--line);height:8px':'')+'"></div>'+
+      '<div style="font-size:10px;color:var(--ink2)">'+m.label.substring(0,3)+'</div>'+
+    '</div>';
+  }).join('');
+  document.getElementById('annual-chart-wrap').innerHTML=
+    '<div style="display:flex;align-items:flex-end;gap:6px;padding:10px 0 4px;min-height:200px">'+bars+'</div>'+
+    '<div style="font-size:11px;color:var(--ink3);margin-top:8px;font-family:\'IBM Plex Mono\',monospace">Bars in green are imported actuals · teal are live from daily readings · dashed are pending</div>';
+}
 function renderMonthlySummary(){
   const wrap=document.getElementById('monthly-summary-wrap');
   if(!wrap)return;
