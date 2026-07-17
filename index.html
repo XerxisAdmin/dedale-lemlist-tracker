@@ -182,6 +182,7 @@ tbody tr:hover{background:var(--panel2)}
   <div class="tabbar">
     <button class="active" onclick="switchView('dashboard',this)">Dashboard</button>
     <button onclick="switchView('log',this)">Log Readings</button>
+    <button onclick="switchView('weekly',this)">Weekly Teams</button>
     <button onclick="switchView('history',this)">History</button>
     <button onclick="switchView('annual',this)">Annual Overview</button>
   </div>
@@ -319,6 +320,24 @@ tbody tr:hover{background:var(--panel2)}
     <div class="panel">
       <div class="panel-head"><h2>Monthly cost trend</h2></div>
       <div id="annual-chart-wrap"></div>
+    </div>
+  </div>
+
+  <!-- ============ WEEKLY TEAM VIEW ============ -->
+  <div class="view" id="view-weekly">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head" style="align-items:center;flex-wrap:wrap;gap:10px">
+        <h2>Weekly Team Credit Monitor</h2>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="btn btn-ghost btn-sm" onclick="weekNav(-1)">‹ Prev</button>
+          <span class="mono" id="week-label" style="min-width:190px;text-align:center;color:var(--ink);font-size:13px"></span>
+          <button class="btn btn-ghost btn-sm" id="week-next-btn" onclick="weekNav(1)">Next ›</button>
+          <button class="btn btn-ghost btn-sm" onclick="weekNav(0)">This week</button>
+        </div>
+      </div>
+      <p style="color:var(--ink2);font-size:13px;margin:0 0 16px">Mon–Fri consumption per team. Starting = first balance logged that week · Current = latest balance logged that week · Refills = mid-day credit top-ups detected during the week.</p>
+      <div class="kpis" id="weekly-kpis" style="margin-bottom:20px"></div>
+      <div id="weekly-table-wrap"></div>
     </div>
   </div>
 
@@ -578,6 +597,7 @@ function switchView(v,btn){
   document.querySelectorAll('.tabbar button').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   if(v==='dashboard')renderDashboard();
+  if(v==='weekly')renderWeekly();
   if(v==='history')renderHistory();
   if(v==='annual')renderAnnual();
 }
@@ -934,6 +954,109 @@ function liveMonthlyEUR(monthPrefix){
   });
   return hasData?costEUR(credits):null;
 }
+/* ---------- weekly team view ---------- */
+let weekOffset = 0; // 0 = current week, -1 = last week, etc.
+// Monday of the week containing `date`, as a Date at local midnight
+function mondayOf(date){
+  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const dow = d.getDay(); // 0=Sun..6=Sat
+  const diff = (dow === 0 ? -6 : 1 - dow); // shift back to Monday
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+function ymd(d){return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+function weekNav(dir){
+  if(dir===0) weekOffset=0; else weekOffset+=dir;
+  if(weekOffset>0) weekOffset=0; // never navigate into the future
+  renderWeekly();
+}
+function renderWeekly(){
+  // Determine the Mon–Fri window for the selected week
+  const base = new Date();
+  base.setDate(base.getDate() + weekOffset*7);
+  const monday = mondayOf(base);
+  const weekDates = [];
+  for(let i=0;i<5;i++){ const d=new Date(monday); d.setDate(monday.getDate()+i); weekDates.push(ymd(d)); }
+  const friday = new Date(monday); friday.setDate(monday.getDate()+4);
+
+  // Label + disable "Next" when already at current week
+  const fmtShort = d => d.toLocaleDateString(undefined,{month:'short',day:'numeric'});
+  document.getElementById('week-label').textContent = fmtShort(monday)+' – '+fmtShort(friday)+', '+friday.getFullYear();
+  document.getElementById('week-next-btn').disabled = (weekOffset>=0);
+  document.getElementById('week-next-btn').style.opacity = (weekOffset>=0)?'0.4':'1';
+
+  // Which of the week's dates actually have readings, in order
+  const daysWithData = weekDates.filter(d => recFor(d));
+
+  // Per-team aggregation across the week
+  const rows = teams.map(tm=>{
+    let used=0, refills=0;
+    daysWithData.forEach(d=>{
+      used += teamConsumption(d,tm.id).total;
+      refills += teamRefill(d,tm.id).added;
+    });
+    // Starting = earliest known balance in the week (start→noon→end of first day with data)
+    let starting=null;
+    for(const d of daysWithData){
+      const b=recFor(d).bal[tm.id];
+      if(b){ const v=b.start??b.noon??b.end; if(v!=null){ starting=v; break; } }
+    }
+    // Current = latest known balance in the week (end→noon→start of last day with data)
+    let current=null;
+    for(let i=daysWithData.length-1;i>=0;i--){
+      const b=recFor(daysWithData[i]).bal[tm.id];
+      if(b){ const v=b.end??b.noon??b.start; if(v!=null){ current=v; break; } }
+    }
+    return { tm, used, refills, starting, current };
+  });
+
+  const weekTotalUsed = rows.reduce((s,r)=>s+r.used,0);
+
+  // KPIs
+  const totalRefills = rows.reduce((s,r)=>s+r.refills,0);
+  const totalCurrent = rows.reduce((s,r)=>s+(r.current||0),0);
+  document.getElementById('weekly-kpis').innerHTML =
+    '<div class="kpi cost"><div class="accent-bar"></div><div class="cap">Total used this week</div><div class="big">'+fmt(weekTotalUsed)+'</div><div class="foot">'+moneyPlain(weekTotalUsed)+'</div></div>'+
+    '<div class="kpi refill"><div class="accent-bar"></div><div class="cap">Total refills</div><div class="big">'+(totalRefills>0?'⟳ '+fmt(totalRefills):'—')+'</div><div class="foot">credits added mid-week</div></div>'+
+    '<div class="kpi rate"><div class="accent-bar"></div><div class="cap">Current balance (all teams)</div><div class="big">'+fmt(totalCurrent)+'</div><div class="foot">latest logged this week</div></div>'+
+    '<div class="kpi runout"><div class="accent-bar"></div><div class="cap">Days logged</div><div class="big">'+daysWithData.length+' / 5</div><div class="foot">Mon–Fri readings present</div></div>';
+
+  // Table
+  if(!daysWithData.length){
+    document.getElementById('weekly-table-wrap').innerHTML='<div class="empty" style="padding:28px;text-align:center;color:var(--ink3)">No readings logged for this week.<br>Use ‹ Prev to view an earlier week.</div>';
+    return;
+  }
+  const body = rows.map(r=>{
+    const pct = weekTotalUsed>0 ? (r.used/weekTotalUsed*100) : 0;
+    return '<tr>'+
+      '<td><span class="team-name"><span class="dot" style="background:'+r.tm.color+'"></span>'+esc(r.tm.name)+'</span></td>'+
+      '<td class="num">'+(r.starting!=null?fmt(r.starting):'—')+'</td>'+
+      '<td class="num" style="font-weight:600">'+(r.used>0?fmt(r.used):'—')+'</td>'+
+      '<td class="num">'+(r.refills>0?'⟳ '+fmt(r.refills):'—')+'</td>'+
+      '<td class="num">'+(r.current!=null?fmt(r.current):'—')+'</td>'+
+      '<td class="num" style="color:var(--credit)">'+(r.used>0?eur(costEUR(r.used)):'—')+'</td>'+
+      '<td class="num" style="color:var(--ink2)">'+(r.used>0?usd(costUSD(r.used)):'—')+'</td>'+
+      '<td class="num">'+(r.used>0?
+        '<div style="display:flex;align-items:center;gap:8px;justify-content:flex-end"><span style="font-size:12px;color:var(--ink2);min-width:38px;text-align:right">'+pct.toFixed(1)+'%</span><div style="width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+r.tm.color+'"></div></div></div>'
+        :'—')+'</td>'+
+    '</tr>';
+  }).join('');
+  // Totals row
+  const totalStarting = rows.reduce((s,r)=>s+(r.starting||0),0);
+  const foot = '<tr style="border-top:2px solid var(--line2);font-weight:700">'+
+    '<td>TOTAL</td>'+
+    '<td class="num">'+fmt(totalStarting)+'</td>'+
+    '<td class="num">'+fmt(weekTotalUsed)+'</td>'+
+    '<td class="num">'+(totalRefills>0?'⟳ '+fmt(totalRefills):'—')+'</td>'+
+    '<td class="num">'+fmt(totalCurrent)+'</td>'+
+    '<td class="num" style="color:var(--credit)">'+eur(costEUR(weekTotalUsed))+'</td>'+
+    '<td class="num" style="color:var(--ink2)">'+usd(costUSD(weekTotalUsed))+'</td>'+
+    '<td class="num">100%</td>'+
+  '</tr>';
+  document.getElementById('weekly-table-wrap').innerHTML =
+    '<table><thead><tr><th>Team</th><th>Starting</th><th>Used</th><th>Refills</th><th>Current</th><th>Cost (€)</th><th>Cost ($)</th><th>% of week</th></tr></thead><tbody>'+body+foot+'</tbody></table>';
+}
+
 function renderAnnual(){
   document.getElementById('annual-year-label').textContent=ANNUAL_YEAR+' · planning team';
   const months=[];
