@@ -104,6 +104,9 @@ tbody tr:hover{background:var(--panel2)}
 
 /* ---- Empty state ---- */
 .empty{text-align:center;padding:50px 20px;color:var(--ink3)}
+.formula-note{background:var(--panel2,rgba(255,255,255,.03));border:1px solid var(--line);border-left:3px solid var(--credit);border-radius:8px;padding:12px 16px;margin:0 0 18px}
+.formula-note-title{font-size:12px;font-weight:600;color:var(--ink);margin-bottom:6px;letter-spacing:.3px}
+.formula-note-body{font-size:12px;color:var(--ink2);line-height:1.7;font-family:'IBM Plex Mono',monospace}
 .empty .icon{font-size:34px;margin-bottom:12px;opacity:.5}
 .empty p{font-size:14px;max-width:380px;margin:0 auto 6px}
 
@@ -183,6 +186,7 @@ tbody tr:hover{background:var(--panel2)}
     <button class="active" onclick="switchView('dashboard',this)">Dashboard</button>
     <button onclick="switchView('log',this)">Log Readings</button>
     <button onclick="switchView('weekly',this)">Weekly Teams</button>
+    <button onclick="switchView('monthly',this)">Monthly Teams</button>
     <button onclick="switchView('history',this)">History</button>
     <button onclick="switchView('annual',this)">Annual Overview</button>
   </div>
@@ -335,9 +339,45 @@ tbody tr:hover{background:var(--panel2)}
           <button class="btn btn-ghost btn-sm" onclick="weekNav(0)">This week</button>
         </div>
       </div>
-      <p style="color:var(--ink2);font-size:13px;margin:0 0 16px">Mon–Fri consumption per team. Starting = first balance logged that week · Current = latest balance logged that week · Refills = mid-day credit top-ups detected during the week.</p>
+      <div class="formula-note">
+        <div class="formula-note-title">📐 How these numbers are calculated</div>
+        <div class="formula-note-body">
+          <b>Period:</b> Monday–Friday of the selected week.<br>
+          <b>Starting</b> = first balance logged that week · <b>Ending</b> = last balance logged that week (the actual reading).<br>
+          <b>Refills</b> = upward jumps of ~5,000 credits detected between readings, snapped to whole 5,000 packs.<br>
+          <b>Used</b> = Starting + Refills − Ending &nbsp;<span style="color:var(--ink3)">(Finance formula)</span><br>
+          <b>⚠</b> = the numbers don't reconcile (e.g. an undetected top-up or a mistyped reading) — review that team.
+        </div>
+      </div>
       <div class="kpis" id="weekly-kpis" style="margin-bottom:20px"></div>
       <div id="weekly-table-wrap"></div>
+    </div>
+  </div>
+
+  <!-- ============ MONTHLY TEAM VIEW ============ -->
+  <div class="view" id="view-monthly">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head" style="align-items:center;flex-wrap:wrap;gap:10px">
+        <h2>Monthly Team Credit Monitor</h2>
+        <div style="display:flex;align-items:center;gap:8px">
+          <button class="btn btn-ghost btn-sm" onclick="monthNav(-1)">‹ Prev</button>
+          <span class="mono" id="month-label" style="min-width:170px;text-align:center;color:var(--ink);font-size:13px"></span>
+          <button class="btn btn-ghost btn-sm" id="month-next-btn" onclick="monthNav(1)">Next ›</button>
+          <button class="btn btn-ghost btn-sm" onclick="monthNav(0)">This month</button>
+        </div>
+      </div>
+      <div class="formula-note">
+        <div class="formula-note-title">📐 How these numbers are calculated</div>
+        <div class="formula-note-body">
+          <b>Period:</b> 1st to last day of the selected calendar month.<br>
+          <b>Starting</b> = first balance logged that month · <b>Ending</b> = last balance logged that month (the actual reading).<br>
+          <b>Refills</b> = upward jumps of ~5,000 credits detected between readings, snapped to whole 5,000 packs.<br>
+          <b>Used</b> = Starting + Refills − Ending &nbsp;<span style="color:var(--ink3)">(Finance formula)</span><br>
+          <b>⚠</b> = the numbers don't reconcile (e.g. an undetected top-up or a mistyped reading) — review that team.
+        </div>
+      </div>
+      <div class="kpis" id="monthly-kpis" style="margin-bottom:20px"></div>
+      <div id="monthly-table-wrap"></div>
     </div>
   </div>
 
@@ -600,6 +640,7 @@ function switchView(v,btn){
   btn.classList.add('active');
   if(v==='dashboard')renderDashboard();
   if(v==='weekly')renderWeekly();
+  if(v==='monthly')renderMonthly();
   if(v==='history')renderHistory();
   if(v==='annual')renderAnnual();
 }
@@ -957,8 +998,9 @@ function liveMonthlyEUR(monthPrefix){
   return hasData?costEUR(credits):null;
 }
 // Walk a team's full chronological balance sequence across the given dates.
-// Detects 5,000-snap refills on upward jumps and derives Used from reconciliation,
-// so Alvin's formula (Starting + Refills − Used = Ending) holds by construction.
+// Detects 5,000-snap refills on upward jumps, then derives Used directly from
+// Alvin's identity (Used = Starting + Refills − Ending) so the row ALWAYS reconciles.
+// The only thing detected from the balance walk is how many 5,000 packs were added.
 function teamWeekCalc(tmId, dates){
   // Build ordered list of known balance points across the week: [start,noon,end] per day, skipping nulls.
   const points=[];
@@ -968,30 +1010,38 @@ function teamWeekCalc(tmId, dates){
     ['start','noon','end'].forEach(k=>{ if(b[k]!=null) points.push(b[k]); });
   });
   if(!points.length) return {starting:null,ending:null,used:0,refillCredits:0,refillPacks:0,reconciles:true,hasData:false};
+
+  // Starting = earliest logged balance of the week (first day with data, earliest filled slot).
   const starting=points[0];
-  const ending=points[points.length-1];
-  let used=0, refillCredits=0, refillPacks=0;
+
+  // Ending = latest logged balance of the week. Scan the LAST day that has data and take its
+  // latest filled slot (6pm → 12nn → 9am), so a blank final checkpoint can't truncate the week
+  // early and grab a mid-week dip by mistake.
+  let ending=points[points.length-1];
+  for(let i=dates.length-1;i>=0;i--){
+    const r=recFor(dates[i]); if(!r||!r.bal[tmId]) continue;
+    const b=r.bal[tmId];
+    const v = b.end ?? b.noon ?? b.start;
+    if(v!=null){ ending=v; break; }
+  }
+
+  // Detect refills: count every upward jump ≥ half a pack, snapped to nearest 5,000.
+  let refillPacks=0;
   for(let i=1;i<points.length;i++){
     const delta=points[i]-points[i-1];
-    if(delta<0){
-      // balance dropped = consumption
-      used+=(-delta);
-    }else if(delta>=REFILL_MIN_JUMP){
-      // upward jump big enough = one or more 5,000 packs; snap to nearest pack
-      const packs=Math.max(1,Math.round(delta/REFILL_PACK));
-      const credited=packs*REFILL_PACK;
-      refillPacks+=packs;
-      refillCredits+=credited;
-      // usage that happened alongside the refill: credited − observed rise
-      const hiddenUse=credited-delta;
-      if(hiddenUse>0) used+=hiddenUse;
+    if(delta>=REFILL_MIN_JUMP){
+      refillPacks+=Math.max(1,Math.round(delta/REFILL_PACK));
     }
-    // small positive deltas (< REFILL_MIN_JUMP) treated as noise: no refill, no usage
   }
-  // Reconciliation check against Alvin's formula
-  const expectedEnding=starting+refillCredits-used;
-  const reconciles=Math.abs(expectedEnding-ending)<1; // integers, allow rounding slack
-  return {starting,ending,used,refillCredits,refillPacks,reconciles,hasData:true};
+  const refillCredits=refillPacks*REFILL_PACK;
+
+  // Used follows from Alvin's formula — this guarantees reconciliation.
+  const used=starting+refillCredits-ending;
+
+  // A row only "fails" to reconcile if the formula gives an impossible (negative) Used,
+  // which means a refill was missed or a reading was mistyped — a genuine data flag.
+  const reconciles = used>=0;
+  return {starting,ending,used:Math.max(0,used),refillCredits,refillPacks,reconciles,hasData:true};
 }
 
 /* ---------- weekly team view ---------- */
@@ -1092,6 +1142,93 @@ function renderWeekly(){
 
   document.getElementById('weekly-table-wrap').innerHTML =
     '<table><thead><tr><th>Team</th><th>Starting</th><th>Refills</th><th>Used</th><th>Ending</th><th>Cost (€)</th><th>Cost ($)</th><th>% of week</th></tr></thead><tbody>'+body+foot+'</tbody></table>'+note;
+}
+
+/* ---------- monthly team view ---------- */
+let monthOffset = 0; // 0 = current month, -1 = last month, etc.
+function monthNav(dir){
+  if(dir===0) monthOffset=0; else monthOffset+=dir;
+  if(monthOffset>0) monthOffset=0; // never navigate into the future
+  renderMonthly();
+}
+function renderMonthly(){
+  // Determine the calendar-month window
+  const now = new Date();
+  const target = new Date(now.getFullYear(), now.getMonth()+monthOffset, 1);
+  const year = target.getFullYear(), mon = target.getMonth();
+  const daysInMonth = new Date(year, mon+1, 0).getDate();
+  const monthDates = [];
+  for(let d=1; d<=daysInMonth; d++){ monthDates.push(ymd(new Date(year, mon, d))); }
+
+  document.getElementById('month-label').textContent = target.toLocaleDateString(undefined,{month:'long',year:'numeric'});
+  document.getElementById('month-next-btn').disabled = (monthOffset>=0);
+  document.getElementById('month-next-btn').style.opacity = (monthOffset>=0)?'0.4':'1';
+
+  const daysWithData = monthDates.filter(d => recFor(d));
+
+  const rows = teams.map(tm=>{
+    const calc = teamWeekCalc(tm.id, monthDates); // same reconciled calc, over the month's dates
+    return { tm, ...calc };
+  });
+
+  const totUsed = rows.reduce((s,r)=>s+r.used,0);
+  const totRefillCredits = rows.reduce((s,r)=>s+r.refillCredits,0);
+  const totPacks = rows.reduce((s,r)=>s+r.refillPacks,0);
+  const totStarting = rows.reduce((s,r)=>s+(r.starting||0),0);
+  const totEnding = rows.reduce((s,r)=>s+(r.ending||0),0);
+  const anyMismatch = rows.some(r=>r.hasData && !r.reconciles);
+
+  document.getElementById('monthly-kpis').innerHTML =
+    '<div class="kpi cost"><div class="accent-bar"></div><div class="cap">Total used this month</div><div class="big">'+fmt(totUsed)+'</div><div class="foot">'+moneyPlain(totUsed)+'</div></div>'+
+    '<div class="kpi refill"><div class="accent-bar"></div><div class="cap">Refills</div><div class="big">'+(totPacks>0?'⟳ '+totPacks+'×5k':'—')+'</div><div class="foot">'+(totRefillCredits>0?fmt(totRefillCredits)+' credits added':'no refills detected')+'</div></div>'+
+    '<div class="kpi rate"><div class="accent-bar"></div><div class="cap">Ending balance (all teams)</div><div class="big">'+fmt(totEnding)+'</div><div class="foot">Start + Refills − Used</div></div>'+
+    '<div class="kpi runout"><div class="accent-bar"></div><div class="cap">Days logged</div><div class="big">'+daysWithData.length+' / '+daysInMonth+'</div><div class="foot">days with readings</div></div>';
+
+  if(!daysWithData.length){
+    document.getElementById('monthly-table-wrap').innerHTML='<div class="empty" style="padding:28px;text-align:center;color:var(--ink3)">No readings logged for this month.<br>Use ‹ Prev to view an earlier month.</div>';
+    return;
+  }
+
+  const body = rows.map(r=>{
+    if(!r.hasData){
+      return '<tr style="opacity:.4"><td><span class="team-name"><span class="dot" style="background:'+r.tm.color+'"></span>'+esc(r.tm.name)+'</span></td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td></tr>';
+    }
+    const pct = totUsed>0 ? (r.used/totUsed*100) : 0;
+    const flag = r.reconciles ? '' : ' <span title="Numbers don\'t reconcile — check this team\'s readings" style="color:var(--danger);cursor:help">⚠</span>';
+    const refillCell = r.refillPacks>0
+      ? '⟳ '+fmt(r.refillCredits)+' <span style="color:var(--ink3);font-size:.85em">('+r.refillPacks+'×5k)</span>'
+      : '—';
+    return '<tr>'+
+      '<td><span class="team-name"><span class="dot" style="background:'+r.tm.color+'"></span>'+esc(r.tm.name)+'</span>'+flag+'</td>'+
+      '<td class="num">'+(r.starting!=null?fmt(r.starting):'—')+'</td>'+
+      '<td class="num">'+refillCell+'</td>'+
+      '<td class="num" style="font-weight:600">'+(r.used>0?fmt(r.used):'—')+'</td>'+
+      '<td class="num" style="font-weight:600">'+(r.ending!=null?fmt(r.ending):'—')+'</td>'+
+      '<td class="num" style="color:var(--credit)">'+(r.used>0?eur(costEUR(r.used)):'—')+'</td>'+
+      '<td class="num" style="color:var(--ink2)">'+(r.used>0?usd(costUSD(r.used)):'—')+'</td>'+
+      '<td class="num">'+(r.used>0?
+        '<div style="display:flex;align-items:center;gap:8px;justify-content:flex-end"><span style="font-size:12px;color:var(--ink2);min-width:38px;text-align:right">'+pct.toFixed(1)+'%</span><div style="width:60px;height:6px;background:var(--line);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+r.tm.color+'"></div></div></div>'
+        :'—')+'</td>'+
+    '</tr>';
+  }).join('');
+
+  const foot = '<tr style="border-top:2px solid var(--line2);font-weight:700">'+
+    '<td>TOTAL</td>'+
+    '<td class="num">'+fmt(totStarting)+'</td>'+
+    '<td class="num">'+(totPacks>0?'⟳ '+fmt(totRefillCredits):'—')+'</td>'+
+    '<td class="num">'+fmt(totUsed)+'</td>'+
+    '<td class="num">'+fmt(totEnding)+'</td>'+
+    '<td class="num" style="color:var(--credit)">'+eur(costEUR(totUsed))+'</td>'+
+    '<td class="num" style="color:var(--ink2)">'+usd(costUSD(totUsed))+'</td>'+
+    '<td class="num">100%</td>'+
+  '</tr>';
+
+  const note = anyMismatch
+    ? '<div style="font-size:12px;color:var(--danger);margin-top:10px;font-family:\'IBM Plex Mono\',monospace">⚠ One or more teams don\'t reconcile (Starting + Refills − Used ≠ Ending) — likely a mistyped reading or an undetected refill. Check the flagged rows.</div>'
+    : '<div style="font-size:12px;color:var(--ink3);margin-top:10px;font-family:\'IBM Plex Mono\',monospace">Ending = Starting + Refills − Used · refills auto-detected as 5,000 packs</div>';
+
+  document.getElementById('monthly-table-wrap').innerHTML =
+    '<table><thead><tr><th>Team</th><th>Starting</th><th>Refills</th><th>Used</th><th>Ending</th><th>Cost (€)</th><th>Cost ($)</th><th>% of month</th></tr></thead><tbody>'+body+foot+'</tbody></table>'+note;
 }
 
 function renderAnnual(){
